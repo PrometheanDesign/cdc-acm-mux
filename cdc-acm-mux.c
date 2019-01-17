@@ -51,14 +51,18 @@
 #include <linux/idr.h>
 #include <linux/list.h>
 
-#include "cdc-acm.h"
+#include "cdc-acm-mux.h"
 
 
 #define DRIVER_AUTHOR "Armin Fuerst, Pavel Machek, Johannes Erdfelt, Vojtech Pavlik, David Kubicek, Johan Hovold"
 #define DRIVER_DESC "USB Abstract Control Model driver for USB modems and ISDN adapters"
+// Modified to implement multiple multiplexed tty character devices by Scott Wagner <scott.wagner@promethean-design.com>
 
 static struct usb_driver acm_driver;
 static struct tty_driver *acm_tty_driver;
+static struct tty_driver *acm_tty_driver_2;  /* Auxiliary multiplexed tty device */
+static unsigned int default_transaction_response_time=(HZ/2); // 500 mS time for a transaction to complete before timeout
+static unsigned int default_transaction_continuation_time=(HZ/40); // 25 mS time for a started read to complete before timeout
 
 static DEFINE_IDR(acm_minors);
 static DEFINE_MUTEX(acm_minors_lock);
@@ -74,19 +78,28 @@ static void acm_tty_set_termios(struct tty_struct *tty,
  * Look up an ACM structure by minor. If found and not disconnected, increment
  * its refcount and return it with its mutex held.
  */
-static struct acm *acm_get_by_minor(unsigned int minor)
+static struct acm *acm_get_by_minor(int major, unsigned int minor, struct acm_mux **pmux)
 {
 	struct acm *acm;
+	int index;
+	struct acm_mux *mux = NULL;
 
 	mutex_lock(&acm_minors_lock);
 	acm = idr_find(&acm_minors, minor);
 	if (acm) {
 		mutex_lock(&acm->mutex);
-		if (acm->disconnected) {
+		for (index = 0; index < sizeof(acm->mux)/sizeof(acm->mux[0]); index++) {
+			if (acm->mux[index].major == major) {
+				mux = &acm->mux[index];
+				break;
+			}
+		}
+		if (mux == NULL || acm->disconnected) {
 			mutex_unlock(&acm->mutex);
 			acm = NULL;
 		} else {
-			tty_port_get(&acm->port);
+			tty_port_get(&mux->port);
+			*pmux = mux;
 			mutex_unlock(&acm->mutex);
 		}
 	}
@@ -281,6 +294,58 @@ static ssize_t show_country_rel_date
 }
 
 static DEVICE_ATTR(iCountryCodeRelDate, S_IRUGO, show_country_rel_date, NULL);
+
+static ssize_t show_transaction_response_time
+(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct acm *acm = usb_get_intfdata(intf);
+
+	return sprintf(buf, "%u\n", (acm->transaction_response_time*1000)/HZ);
+}
+static ssize_t store_transaction_response_time
+(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct acm *acm = usb_get_intfdata(intf);
+	int val = simple_strtol(buf, NULL, 10);
+	if (val > 0) {
+		acm->transaction_response_time = (val*HZ)/1000;
+		if (acm->transaction_response_time == 0) {
+			acm->transaction_response_time = 1;
+		}
+	}
+	return count;
+}
+
+static DEVICE_ATTR(TransactionResponseTime, S_IRUGO|S_IWUSR|S_IWGRP,
+		show_transaction_response_time, store_transaction_response_time);
+
+static ssize_t show_transaction_continuation_time
+(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct acm *acm = usb_get_intfdata(intf);
+
+	return sprintf(buf, "%u\n", (acm->transaction_continuation_time*1000)/HZ);
+}
+static ssize_t store_transaction_continuation_time
+(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct usb_interface *intf = to_usb_interface(dev);
+	struct acm *acm = usb_get_intfdata(intf);
+	int val = simple_strtol(buf, NULL, 10);
+	if (val > 0) {
+		acm->transaction_continuation_time = (val*HZ)/1000;
+		if (acm->transaction_continuation_time == 0) {
+			acm->transaction_continuation_time = 1;
+		}
+	}
+	return count;
+}
+
+static DEVICE_ATTR(TransactionContinuationTime, S_IRUGO|S_IWUSR|S_IWGRP,
+		show_transaction_continuation_time, store_transaction_continuation_time);
 /*
  * Interrupt handlers for various ACM device responses
  */
@@ -312,7 +377,10 @@ static void acm_process_notification(struct acm *acm, unsigned char *buf)
 		if (!acm->clocal && (acm->ctrlin & ~newctrl & ACM_CTRL_DCD)) {
 			dev_dbg(&acm->control->dev,
 				"%s - calling hangup\n", __func__);
-			tty_port_tty_hangup(&acm->port, false);
+			if (tty_port_initialized(&acm->mux[0].port))
+				tty_port_tty_hangup(&acm->mux[0].port, false);
+			if (tty_port_initialized(&acm->mux[1].port))
+				tty_port_tty_hangup(&acm->mux[1].port, false);
 		}
 
 		difference = acm->ctrlin ^ newctrl;
@@ -367,6 +435,7 @@ static void acm_ctrl_irq(struct urb *urb)
 	case -ENOENT:
 	case -ESHUTDOWN:
 		/* this urb is terminated, clean up */
+		acm->nb_index = 0;
 		dev_dbg(&acm->control->dev,
 			"%s - urb shutting down with status: %d\n",
 			__func__, status);
@@ -468,12 +537,14 @@ static int acm_submit_read_urbs(struct acm *acm, gfp_t mem_flags)
 
 static void acm_process_read_urb(struct acm *acm, struct urb *urb)
 {
-	if (!urb->actual_length)
+	if (!urb->actual_length || acm->cur_mux == NULL)
 		return;
-
-	tty_insert_flip_string(&acm->port, urb->transfer_buffer,
+   if (timer_pending(&acm->transaction_timer)) { // Extend timeout if necessary
+		mod_timer(&acm->transaction_timer, jiffies + acm->transaction_continuation_time);
+	}
+	tty_insert_flip_string(&acm->cur_mux->port, urb->transfer_buffer,
 			urb->actual_length);
-	tty_flip_buffer_push(&acm->port);
+	tty_flip_buffer_push(&acm->cur_mux->port);
 }
 
 static void acm_read_bulk_callback(struct urb *urb)
@@ -571,7 +642,12 @@ static void acm_softint(struct work_struct *work)
 	}
 
 	if (test_bit(EVENT_TTY_WAKEUP, &acm->flags)) {
-		tty_port_tty_wakeup(&acm->port);
+		if (tty_port_initialized(&acm->mux[0].port)) {
+			tty_port_tty_wakeup(&acm->mux[0].port);
+		}
+		if (tty_port_initialized(&acm->mux[1].port)) {
+			tty_port_tty_wakeup(&acm->mux[1].port);
+		}
 		clear_bit(EVENT_TTY_WAKEUP, &acm->flags);
 	}
 }
@@ -583,12 +659,14 @@ static void acm_softint(struct work_struct *work)
 static int acm_tty_install(struct tty_driver *driver, struct tty_struct *tty)
 {
 	struct acm *acm;
+	struct acm_mux *mux = NULL;
 	int retval;
 
-	acm = acm_get_by_minor(tty->index);
+	acm = acm_get_by_minor(driver->major, tty->index, &mux);
 	if (!acm)
 		return -ENODEV;
 
+	tty->driver_data = mux;
 	retval = tty_standard_install(driver, tty);
 	if (retval)
 		goto error_init_termios;
@@ -600,25 +678,28 @@ static int acm_tty_install(struct tty_driver *driver, struct tty_struct *tty)
 	if (acm->quirks & DISABLE_ECHO)
 		tty->termios.c_lflag &= ~ECHO;
 
-	tty->driver_data = acm;
-
 	return 0;
 
 error_init_termios:
-	tty_port_put(&acm->port);
+	tty_port_put(&mux->port);
+	tty_port_set_initialized(&mux->port, 0);
+
 	return retval;
 }
 
 static int acm_tty_open(struct tty_struct *tty, struct file *filp)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
+	dev_info(&acm->data->dev, "Open driver, major %d (%d), minor %d (%d)\n", MAJOR(filp->f_inode->i_rdev), mux->major, MINOR(filp->f_inode->i_rdev), tty->index);
 
-	return tty_port_open(&acm->port, tty, filp);
+	return tty_port_open(&mux->port, tty, filp);
 }
 
 static void acm_port_dtr_rts(struct tty_port *port, int raise)
 {
-	struct acm *acm = container_of(port, struct acm, port);
+	struct acm_mux *mux = container_of(port, struct acm_mux, port);
+	struct acm *acm = mux->acm;
 	int val;
 	int res;
 
@@ -637,11 +718,19 @@ static void acm_port_dtr_rts(struct tty_port *port, int raise)
 
 static int acm_port_activate(struct tty_port *port, struct tty_struct *tty)
 {
-	struct acm *acm = container_of(port, struct acm, port);
+	struct acm_mux *mux = container_of(port, struct acm_mux, port);
+	struct acm *acm = mux->acm;
 	int retval = -ENODEV;
 	int i;
 
 	mutex_lock(&acm->mutex);
+	i = mux - &acm->mux[0];
+	if (acm->active_mask != 0) { // If already active, nothing to do here
+		acm->active_mask |= (1 << i);
+		mutex_unlock(&acm->mutex);
+		return 0;
+	}
+	acm->active_mask = (1 << i);
 	if (acm->disconnected)
 		goto disconnected;
 
@@ -699,7 +788,8 @@ disconnected:
 
 static void acm_port_destruct(struct tty_port *port)
 {
-	struct acm *acm = container_of(port, struct acm, port);
+	struct acm_mux *mux = container_of(port, struct acm_mux, port);
+	struct acm *acm = mux->acm;
 
 	acm_release_minor(acm);
 	usb_put_intf(acm->control);
@@ -709,9 +799,20 @@ static void acm_port_destruct(struct tty_port *port)
 
 static void acm_port_shutdown(struct tty_port *port)
 {
-	struct acm *acm = container_of(port, struct acm, port);
+	struct acm_mux *mux = container_of(port, struct acm_mux, port);
+	struct acm *acm = mux->acm;
 	struct urb *urb;
 	struct acm_wb *wb;
+
+	int i;
+	mutex_lock(&acm->mutex);
+	i = mux - &acm->mux[0];
+	acm->active_mask &= ~(1 << i);
+	if (acm->active_mask != 0) { // If others active, nothing to do here
+		mutex_unlock(&acm->mutex);
+		return;
+	}
+	mutex_unlock(&acm->mutex);
 
 	/*
 	 * Need to grab write_lock to prevent race with resume, but no need to
@@ -738,29 +839,32 @@ static void acm_port_shutdown(struct tty_port *port)
 
 static void acm_tty_cleanup(struct tty_struct *tty)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
 
-	tty_port_put(&acm->port);
+	tty_port_put(&mux->port);
+	tty_port_set_initialized(&mux->port, 0);
+
 }
 
 static void acm_tty_hangup(struct tty_struct *tty)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
 
-	tty_port_hangup(&acm->port);
+	tty_port_hangup(&mux->port);
 }
 
 static void acm_tty_close(struct tty_struct *tty, struct file *filp)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
 
-	tty_port_close(&acm->port, tty, filp);
+	tty_port_close(&mux->port, tty, filp);
 }
 
 static int acm_tty_write(struct tty_struct *tty,
 					const unsigned char *buf, int count)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	int stat;
 	unsigned long flags;
 	int wbn;
@@ -772,6 +876,35 @@ static int acm_tty_write(struct tty_struct *tty,
 	dev_vdbg(&acm->data->dev, "%d bytes from tty layer\n", count);
 
 	spin_lock_irqsave(&acm->write_lock, flags);
+	if (acm->cur_mux == NULL) { // If currently idle, mux is ours.
+		acm->cur_mux = mux;
+	}
+	if (acm->cur_mux != mux) { // If someone else is using mux, defer our write
+		int i;
+		struct timespec tss, tse;
+		// Add our mux to the end of the waiting list
+		for (i = 0; i < sizeof(acm->waiting_list)/sizeof(acm->waiting_list[0]) - 1; i++) {
+			if (acm->waiting_list[i] == NULL) {
+				acm->waiting_list[i] = mux;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&acm->write_lock, flags);
+		if (i >= sizeof(acm->waiting_list)/sizeof(acm->waiting_list[0]) - 1) {
+			dev_err(&acm->data->dev, "Major %d write fail: too many devices waiting to write!\n", mux->major);
+			return -ERESTARTSYS;
+		}
+		i = acm->cur_mux->major;
+		getrawmonotonic(&tss);
+		if (wait_event_interruptible(acm->mq, (acm->cur_mux == mux)) != 0) {
+			return -ERESTARTSYS;
+		}
+		getrawmonotonic(&tse);
+		tss = timespec_sub(tse, tss);
+		dev_info(&acm->data->dev, "Major %d waited for major %d, continuing after %d.%03d sec\n",
+				mux->major, i, (int)tss.tv_sec, (int)tss.tv_nsec/1000000);
+		spin_lock_irqsave(&acm->write_lock, flags);
+	}
 	wbn = acm_wb_alloc(acm);
 	if (wbn < 0) {
 		spin_unlock_irqrestore(&acm->write_lock, flags);
@@ -798,12 +931,24 @@ static int acm_tty_write(struct tty_struct *tty,
 	}
 
 	if (acm->susp_count) {
+		if (acm->putbuffer) {
+			/* now to preserve order */
+			usb_anchor_urb(acm->putbuffer->urb, &acm->delayed);
+			acm->putbuffer = NULL;
+		}
 		usb_anchor_urb(wb->urb, &acm->delayed);
 		spin_unlock_irqrestore(&acm->write_lock, flags);
 		return count;
+	} else {
+		if (acm->putbuffer) {
+			/* at this point there is no good way to handle errors */
+			acm_start_wb(acm, acm->putbuffer);
+			acm->putbuffer = NULL;
+		}
 	}
 
 	stat = acm_start_wb(acm, wb);
+	mod_timer(&acm->transaction_timer, jiffies + acm->transaction_response_time);
 	spin_unlock_irqrestore(&acm->write_lock, flags);
 
 	if (stat < 0)
@@ -811,9 +956,72 @@ static int acm_tty_write(struct tty_struct *tty,
 	return count;
 }
 
+static void acm_tty_flush_chars(struct tty_struct *tty)
+{
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
+	struct acm_wb *cur;
+	int err;
+	unsigned long flags;
+
+	spin_lock_irqsave(&acm->write_lock, flags);
+
+	cur = acm->putbuffer;
+	if (!cur) /* nothing to do */
+		goto out;
+
+	acm->putbuffer = NULL;
+	err = usb_autopm_get_interface_async(acm->control);
+	if (err < 0) {
+		cur->use = 0;
+		acm->putbuffer = cur;
+		goto out;
+	}
+
+	if (acm->susp_count)
+		usb_anchor_urb(cur->urb, &acm->delayed);
+	else
+		acm_start_wb(acm, cur);
+out:
+	spin_unlock_irqrestore(&acm->write_lock, flags);
+	return;
+}
+
+static int acm_tty_put_char(struct tty_struct *tty, unsigned char ch)
+{
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
+	struct acm_wb *cur;
+	int wbn;
+	unsigned long flags;
+
+overflow:
+	cur = acm->putbuffer;
+	if (!cur) {
+		spin_lock_irqsave(&acm->write_lock, flags);
+		wbn = acm_wb_alloc(acm);
+		if (wbn >= 0) {
+			cur = &acm->wb[wbn];
+			acm->putbuffer = cur;
+		}
+		spin_unlock_irqrestore(&acm->write_lock, flags);
+		if (!cur)
+			return 0;
+	}
+
+	if (cur->len == acm->writesize) {
+		acm_tty_flush_chars(tty);
+		goto overflow;
+	}
+
+	cur->buf[cur->len++] = ch;
+	return 1;
+}
+
 static int acm_tty_write_room(struct tty_struct *tty)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	/*
 	 * Do not let the line discipline to know that we have a reserve,
 	 * or it might get too enthusiastic.
@@ -823,7 +1031,8 @@ static int acm_tty_write_room(struct tty_struct *tty)
 
 static int acm_tty_chars_in_buffer(struct tty_struct *tty)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	/*
 	 * if the device was unplugged then any remaining characters fell out
 	 * of the connector ;)
@@ -838,7 +1047,8 @@ static int acm_tty_chars_in_buffer(struct tty_struct *tty)
 
 static void acm_tty_throttle(struct tty_struct *tty)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 
 	spin_lock_irq(&acm->read_lock);
 	acm->throttle_req = 1;
@@ -847,7 +1057,8 @@ static void acm_tty_throttle(struct tty_struct *tty)
 
 static void acm_tty_unthrottle(struct tty_struct *tty)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	unsigned int was_throttled;
 
 	spin_lock_irq(&acm->read_lock);
@@ -862,7 +1073,8 @@ static void acm_tty_unthrottle(struct tty_struct *tty)
 
 static int acm_tty_break_ctl(struct tty_struct *tty, int state)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	int retval;
 
 	retval = acm_send_break(acm, state ? 0xffff : 0);
@@ -874,7 +1086,8 @@ static int acm_tty_break_ctl(struct tty_struct *tty, int state)
 
 static int acm_tty_tiocmget(struct tty_struct *tty)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 
 	return (acm->ctrlout & ACM_CTRL_DTR ? TIOCM_DTR : 0) |
 	       (acm->ctrlout & ACM_CTRL_RTS ? TIOCM_RTS : 0) |
@@ -887,7 +1100,8 @@ static int acm_tty_tiocmget(struct tty_struct *tty)
 static int acm_tty_tiocmset(struct tty_struct *tty,
 			    unsigned int set, unsigned int clear)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	unsigned int newctrl;
 
 	newctrl = acm->ctrlout;
@@ -903,17 +1117,17 @@ static int acm_tty_tiocmset(struct tty_struct *tty,
 	return acm_set_control(acm, acm->ctrlout = newctrl);
 }
 
-static int get_serial_info(struct acm *acm, struct serial_struct __user *info)
+static int get_serial_info(struct acm_mux *mux, struct serial_struct __user *info)
 {
 	struct serial_struct tmp;
 
 	memset(&tmp, 0, sizeof(tmp));
-	tmp.xmit_fifo_size = acm->writesize;
-	tmp.baud_base = le32_to_cpu(acm->line.dwDTERate);
-	tmp.close_delay	= acm->port.close_delay / 10;
-	tmp.closing_wait = acm->port.closing_wait == ASYNC_CLOSING_WAIT_NONE ?
+	tmp.xmit_fifo_size = mux->acm->writesize;
+	tmp.baud_base = le32_to_cpu(mux->acm->line.dwDTERate);
+	tmp.close_delay	= mux->port.close_delay / 10;
+	tmp.closing_wait = mux->port.closing_wait == ASYNC_CLOSING_WAIT_NONE ?
 				ASYNC_CLOSING_WAIT_NONE :
-				acm->port.closing_wait / 10;
+				mux->port.closing_wait / 10;
 
 	if (copy_to_user(info, &tmp, sizeof(tmp)))
 		return -EFAULT;
@@ -921,7 +1135,7 @@ static int get_serial_info(struct acm *acm, struct serial_struct __user *info)
 		return 0;
 }
 
-static int set_serial_info(struct acm *acm,
+static int set_serial_info(struct acm_mux *mux,
 				struct serial_struct __user *newinfo)
 {
 	struct serial_struct new_serial;
@@ -935,20 +1149,20 @@ static int set_serial_info(struct acm *acm,
 	closing_wait = new_serial.closing_wait == ASYNC_CLOSING_WAIT_NONE ?
 			ASYNC_CLOSING_WAIT_NONE : new_serial.closing_wait * 10;
 
-	mutex_lock(&acm->port.mutex);
+	mutex_lock(&mux->port.mutex);
 
 	if (!capable(CAP_SYS_ADMIN)) {
-		if ((close_delay != acm->port.close_delay) ||
-		    (closing_wait != acm->port.closing_wait))
+		if ((close_delay != mux->port.close_delay) ||
+		    (closing_wait != mux->port.closing_wait))
 			retval = -EPERM;
 		else
 			retval = -EOPNOTSUPP;
 	} else {
-		acm->port.close_delay  = close_delay;
-		acm->port.closing_wait = closing_wait;
+		mux->port.close_delay  = close_delay;
+		mux->port.closing_wait = closing_wait;
 	}
 
-	mutex_unlock(&acm->port.mutex);
+	mutex_unlock(&mux->port.mutex);
 	return retval;
 }
 
@@ -998,7 +1212,8 @@ static int wait_serial_change(struct acm *acm, unsigned long arg)
 static int acm_tty_get_icount(struct tty_struct *tty,
 					struct serial_icounter_struct *icount)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 
 	icount->dsr = acm->iocount.dsr;
 	icount->rng = acm->iocount.rng;
@@ -1014,15 +1229,16 @@ static int acm_tty_get_icount(struct tty_struct *tty,
 static int acm_tty_ioctl(struct tty_struct *tty,
 					unsigned int cmd, unsigned long arg)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	int rv = -ENOIOCTLCMD;
 
 	switch (cmd) {
 	case TIOCGSERIAL: /* gets serial port data */
-		rv = get_serial_info(acm, (struct serial_struct __user *) arg);
+		rv = get_serial_info(mux, (struct serial_struct __user *) arg);
 		break;
 	case TIOCSSERIAL:
-		rv = set_serial_info(acm, (struct serial_struct __user *) arg);
+		rv = set_serial_info(mux, (struct serial_struct __user *) arg);
 		break;
 	case TIOCMIWAIT:
 		rv = usb_autopm_get_interface(acm->control);
@@ -1041,7 +1257,8 @@ static int acm_tty_ioctl(struct tty_struct *tty,
 static void acm_tty_set_termios(struct tty_struct *tty,
 						struct ktermios *termios_old)
 {
-	struct acm *acm = tty->driver_data;
+	struct acm_mux *mux = tty->driver_data;
+	struct acm *acm = mux->acm;
 	struct ktermios *termios = &tty->termios;
 	struct usb_cdc_line_coding newline;
 	int newctrl = acm->ctrlout;
@@ -1140,6 +1357,22 @@ static int acm_write_buffers_alloc(struct acm *acm)
 		}
 	}
 	return 0;
+}
+
+static void transaction_timer_handler(struct timer_list *t) {
+	struct acm *acm = container_of(t, struct acm, transaction_timer);
+	unsigned long flags;
+	spin_lock_irqsave(&acm->write_lock, flags);
+	// Get the waiting device (if any) from the waiting list
+	acm->cur_mux = acm->waiting_list[0];
+	if (acm->cur_mux != NULL) {
+		// Shift waiting list down one element
+		memmove(&acm->waiting_list[0], &acm->waiting_list[1],
+				sizeof(acm->waiting_list) - sizeof(acm->waiting_list[0]));
+		wake_up_interruptible(&acm->mq);
+	}
+	spin_unlock_irqrestore(&acm->write_lock, flags);
+	return;
 }
 
 static int acm_probe(struct usb_interface *intf,
@@ -1361,8 +1594,10 @@ made_compressed_probe:
 		acm->out = usb_sndintpipe(usb_dev, epwrite->bEndpointAddress);
 	else
 		acm->out = usb_sndbulkpipe(usb_dev, epwrite->bEndpointAddress);
-	tty_port_init(&acm->port);
-	acm->port.ops = &acm_port_ops;
+	tty_port_init(&acm->mux[0].port);
+	tty_port_init(&acm->mux[1].port);
+	acm->mux[0].port.ops = &acm_port_ops;
+	acm->mux[1].port.ops = &acm_port_ops;
 	init_usb_anchor(&acm->delayed);
 	acm->quirks = quirks;
 
@@ -1476,7 +1711,7 @@ skip_countries:
 	acm->nb_index = 0;
 	acm->nb_size = 0;
 
-	dev_info(&intf->dev, "ttyACM%d: USB ACM device\n", minor);
+	dev_info(&intf->dev, "ttyACM%d: USB ACM mux device\n", minor);
 
 	acm->line.dwDTERate = cpu_to_le32(9600);
 	acm->line.bDataBits = 8;
@@ -1486,12 +1721,29 @@ skip_countries:
 	usb_set_intfdata(data_interface, acm);
 
 	usb_get_intf(control_interface);
-	tty_dev = tty_port_register_device(&acm->port, acm_tty_driver, minor,
+	tty_dev = tty_port_register_device(&acm->mux[0].port, acm_tty_driver, minor,
 			&control_interface->dev);
 	if (IS_ERR(tty_dev)) {
 		rv = PTR_ERR(tty_dev);
 		goto alloc_fail8;
 	}
+	acm->mux[0].acm = acm;
+	acm->mux[0].major = MAJOR(tty_dev->devt);
+
+	tty_dev = tty_port_register_device(&acm->mux[1].port, acm_tty_driver_2, minor,
+			&control_interface->dev);
+	if (IS_ERR(tty_dev)) {
+		rv = PTR_ERR(tty_dev);
+		goto alloc_fail9;
+	}
+	acm->mux[1].acm = acm;
+	acm->mux[1].major = MAJOR(tty_dev->devt);
+	acm->transaction_response_time = default_transaction_response_time;
+	acm->transaction_continuation_time = default_transaction_continuation_time;
+	init_waitqueue_head(&acm->mq);
+	timer_setup(&acm->transaction_timer, transaction_timer_handler, 0);
+	device_create_file(&acm->control->dev, &dev_attr_TransactionResponseTime);
+	device_create_file(&acm->control->dev, &dev_attr_TransactionContinuationTime);
 
 	if (quirks & CLEAR_HALT_CONDITIONS) {
 		usb_clear_halt(usb_dev, acm->in);
@@ -1499,6 +1751,9 @@ skip_countries:
 	}
 
 	return 0;
+
+alloc_fail9:
+	tty_unregister_device(acm_tty_driver, minor);
 alloc_fail8:
 	if (acm->country_codes) {
 		device_remove_file(&acm->control->dev,
@@ -1541,6 +1796,9 @@ static void acm_disconnect(struct usb_interface *intf)
 
 	mutex_lock(&acm->mutex);
 	acm->disconnected = true;
+	device_remove_file(&acm->control->dev, &dev_attr_TransactionResponseTime);
+	device_remove_file(&acm->control->dev, &dev_attr_TransactionContinuationTime);
+	del_timer_sync(&acm->transaction_timer);
 	if (acm->country_codes) {
 		device_remove_file(&acm->control->dev,
 				&dev_attr_wCountryCodes);
@@ -1553,7 +1811,12 @@ static void acm_disconnect(struct usb_interface *intf)
 	usb_set_intfdata(acm->data, NULL);
 	mutex_unlock(&acm->mutex);
 
-	tty = tty_port_tty_get(&acm->port);
+	tty = tty_port_tty_get(&acm->mux[0].port);
+	if (tty) {
+		tty_vhangup(tty);
+		tty_kref_put(tty);
+	}
+	tty = tty_port_tty_get(&acm->mux[1].port);
 	if (tty) {
 		tty_vhangup(tty);
 		tty_kref_put(tty);
@@ -1562,6 +1825,7 @@ static void acm_disconnect(struct usb_interface *intf)
 	acm_kill_urbs(acm);
 	cancel_work_sync(&acm->work);
 
+	tty_unregister_device(acm_tty_driver_2, acm->minor);
 	tty_unregister_device(acm_tty_driver, acm->minor);
 
 	usb_free_urb(acm->ctrlurb);
@@ -1578,8 +1842,11 @@ static void acm_disconnect(struct usb_interface *intf)
 	if (!acm->combined_interfaces)
 		usb_driver_release_interface(&acm_driver, intf == acm->control ?
 					acm->data : acm->control);
-
-	tty_port_put(&acm->port);
+	if (tty_port_initialized(&acm->mux[0].port) || tty_port_initialized(&acm->mux[1].port)) {
+		tty_port_put(&acm->mux[0].port);
+		tty_port_set_initialized(&acm->mux[0].port, 0);
+		tty_port_set_initialized(&acm->mux[1].port, 0);
+	}
 }
 
 #ifdef CONFIG_PM
@@ -1618,7 +1885,8 @@ static int acm_resume(struct usb_interface *intf)
 	if (--acm->susp_count)
 		goto out;
 
-	if (tty_port_initialized(&acm->port)) {
+	if (tty_port_initialized(&acm->mux[0].port) ||
+			tty_port_initialized(&acm->mux[1].port)) {
 		rv = usb_submit_urb(acm->ctrlurb, GFP_ATOMIC);
 
 		for (;;) {
@@ -1648,8 +1916,10 @@ static int acm_reset_resume(struct usb_interface *intf)
 {
 	struct acm *acm = usb_get_intfdata(intf);
 
-	if (tty_port_initialized(&acm->port))
-		tty_port_tty_hangup(&acm->port, false);
+	if (tty_port_initialized(&acm->mux[0].port))
+		tty_port_tty_hangup(&acm->mux[0].port, false);
+	if (tty_port_initialized(&acm->mux[1].port))
+		tty_port_tty_hangup(&acm->mux[1].port, false);
 
 	return acm_resume(intf);
 }
@@ -1948,6 +2218,8 @@ static const struct tty_operations acm_ops = {
 	.cleanup =		acm_tty_cleanup,
 	.hangup =		acm_tty_hangup,
 	.write =		acm_tty_write,
+	.put_char =		acm_tty_put_char,
+	.flush_chars =		acm_tty_flush_chars,
 	.write_room =		acm_tty_write_room,
 	.ioctl =		acm_tty_ioctl,
 	.throttle =		acm_tty_throttle,
@@ -1988,8 +2260,36 @@ static int __init acm_init(void)
 		return retval;
 	}
 
+	acm_tty_driver_2 = alloc_tty_driver(ACM_TTY_MINORS);
+	if (!acm_tty_driver_2) {
+		tty_unregister_driver(acm_tty_driver);
+		put_tty_driver(acm_tty_driver);
+		return -ENOMEM;
+	}
+	acm_tty_driver_2->driver_name = "acm",
+	acm_tty_driver_2->name = "ttyACM_M",
+	acm_tty_driver_2->major = 0, // Dynamically allocate
+	acm_tty_driver_2->minor_start = 0,
+	acm_tty_driver_2->type = TTY_DRIVER_TYPE_SERIAL,
+	acm_tty_driver_2->subtype = SERIAL_TYPE_NORMAL,
+	acm_tty_driver_2->flags = TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV;
+	acm_tty_driver_2->init_termios = tty_std_termios;
+	acm_tty_driver_2->init_termios.c_cflag = B9600 | CS8 | CREAD |
+								HUPCL | CLOCAL;
+	tty_set_operations(acm_tty_driver_2, &acm_ops);
+
+	retval = tty_register_driver(acm_tty_driver_2);
+	if (retval) {
+		put_tty_driver(acm_tty_driver_2);
+		tty_unregister_driver(acm_tty_driver);
+		put_tty_driver(acm_tty_driver);
+		return retval;
+	}
+
 	retval = usb_register(&acm_driver);
 	if (retval) {
+		tty_unregister_driver(acm_tty_driver_2);
+		put_tty_driver(acm_tty_driver_2);
 		tty_unregister_driver(acm_tty_driver);
 		put_tty_driver(acm_tty_driver);
 		return retval;
@@ -2003,6 +2303,8 @@ static int __init acm_init(void)
 static void __exit acm_exit(void)
 {
 	usb_deregister(&acm_driver);
+	tty_unregister_driver(acm_tty_driver_2);
+	put_tty_driver(acm_tty_driver_2);
 	tty_unregister_driver(acm_tty_driver);
 	put_tty_driver(acm_tty_driver);
 	idr_destroy(&acm_minors);

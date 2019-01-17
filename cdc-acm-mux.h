@@ -20,7 +20,7 @@
  */
 
 #define ACM_TTY_MAJOR		166
-#define ACM_TTY_MINORS		256
+#define ACM_TTY_MINORS		 32
 
 /*
  * Requests.
@@ -80,12 +80,18 @@ struct acm_rb {
 	struct acm		*instance;
 };
 
+struct acm_mux {
+	struct acm *acm;
+	int major;
+	struct tty_port port;			 	/* our tty port data */
+};
+
 struct acm {
 	struct usb_device *dev;				/* the corresponding usb device */
 	struct usb_interface *control;			/* control interface */
 	struct usb_interface *data;			/* data interface */
 	unsigned in, out;				/* i/o pipes */
-	struct tty_port port;			 	/* our tty port data */
+	//struct tty_port port;			 	/* our tty port data */
 	struct urb *ctrlurb;				/* urbs */
 	u8 *ctrl_buffer;				/* buffers of urbs */
 	dma_addr_t ctrl_dma;				/* dma handles of buffers */
@@ -96,6 +102,7 @@ struct acm {
 	unsigned long read_urbs_free;
 	struct urb *read_urbs[ACM_NR];
 	struct acm_rb read_buffers[ACM_NR];
+	struct acm_wb *putbuffer;			/* for acm_tty_put_char() */
 	int rx_buflimit;
 	spinlock_t read_lock;
 	u8 *notification_buffer;			/* to reassemble fragmented notifications */
@@ -127,6 +134,15 @@ struct acm {
 	u8 bInterval;
 	struct usb_anchor delayed;			/* writes queued for a device about to be woken */
 	unsigned long quirks;
+    unsigned long active_mask;
+	struct cdev *pcdev;
+	struct acm_mux mux[2];
+	struct acm_mux *cur_mux;
+    struct acm_mux *waiting_list[ACM_TTY_MINORS]; // Can't have more waiting devices than # of minors
+    wait_queue_head_t mq;
+	struct timer_list transaction_timer;
+    unsigned int transaction_response_time;
+    unsigned int transaction_continuation_time;
 };
 
 #define CDC_DATA_INTERFACE_TYPE	0x0a
