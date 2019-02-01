@@ -901,8 +901,10 @@ static int acm_tty_write(struct tty_struct *tty,
 		}
 		getrawmonotonic(&tse);
 		tss = timespec_sub(tse, tss);
-		dev_info(&acm->data->dev, "Major %d waited for major %d, continuing after %d.%03d sec\n",
-				mux->major, i, (int)tss.tv_sec, (int)tss.tv_nsec/1000000);
+		if (tss.tv_sec > 0 || tss.tv_nsec > 100000000) {
+            dev_info(&acm->data->dev, "Major %d waited for major %d, continuing after %d.%03d sec\n",
+                    mux->major, i, (int)tss.tv_sec, (int)tss.tv_nsec/1000000);
+		}
 		spin_lock_irqsave(&acm->write_lock, flags);
 	}
 	wbn = acm_wb_alloc(acm);
